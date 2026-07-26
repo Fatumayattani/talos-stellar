@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 from enum import IntEnum
 from pathlib import Path
+from threading import Lock
 
 import click
 
@@ -16,6 +17,8 @@ import click
 DEFAULT_MAX_SIZE = 10 * 1024 * 1024
 SUPPORTED_SCHEMA_VERSIONS = {1}
 _AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_ATOMIC_WRITE_LOCKS_GUARD = Lock()
+_ATOMIC_WRITE_LOCKS: dict[str, Lock] = {}
 
 _CHECKPOINT_TABLES = (
     "schedules",
@@ -65,6 +68,14 @@ def validate_size_limit(max_size: int) -> int:
     return max_size
 
 
+def _atomic_write_lock(destination: Path) -> Lock:
+    """Return a process-local lock for one checkpoint destination."""
+
+    destination_key = os.path.normcase(str(destination.resolve()))
+    with _ATOMIC_WRITE_LOCKS_GUARD:
+        return _ATOMIC_WRITE_LOCKS.setdefault(destination_key, Lock())
+
+
 def atomic_write(output_path: Path, data: bytes, max_size: int) -> None:
     """Write checkpoint bytes atomically without leaving partial output."""
 
@@ -75,24 +86,25 @@ def atomic_write(output_path: Path, data: bytes, max_size: int) -> None:
     destination = Path(output_path)
     temporary_path: Path | None = None
 
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            temporary_file.write(data)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
+    with _atomic_write_lock(destination):
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(data)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
 
-        os.replace(temporary_path, destination)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+            os.replace(temporary_path, destination)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 
